@@ -45,33 +45,20 @@ def run(_context):
     def make_ibeam(
         comp, face, beam_len, fw, th, ft, wt, base_name, flange_dir, height_dir
     ):
-        """
-        flange_dir : unit Vector3D along the flange width  (OBB cross-section axis)
-        height_dir : unit Vector3D along the beam height   (OBB cross-section axis)
-
-        Both are in world space.  We project them into sketch space so the
-        I-beam profile follows the body's actual orientation, not the world grid.
-        """
         sketch = comp.sketches.add(face)
         sketch.name = base_name + "_IBeam_Profile"
 
-        # ── Map world-space cross-section axes → sketch-space basis vectors ──
-        # modelToSketchSpace converts a world Point3D to sketch Point2D.
-        # Offsetting the centroid by a unit direction and converting gives us
-        # the direction in sketch coordinates.
         origin = face.centroid
         c = sketch.modelToSketchSpace(origin)
         cx, cy = c.x, c.y
 
         def world_dir_to_sketch(d):
-            """Return the 2-D sketch-space vector for world-space unit vector d."""
             pt = adsk.core.Point3D.create(
                 origin.x + d.x, origin.y + d.y, origin.z + d.z
             )
             sk = sketch.modelToSketchSpace(pt)
             return sk.x - cx, sk.y - cy
 
-        # u = flange direction (horizontal),  v = height direction (vertical)
         ux, uy = world_dir_to_sketch(flange_dir)
         vx, vy = world_dir_to_sketch(height_dir)
 
@@ -100,7 +87,6 @@ def run(_context):
         for i in range(len(pts)):
             lines.addByTwoPoints(pts[i], pts[(i + 1) % len(pts)])
 
-        # Smallest-area profile that contains the web centroid = the I-shape
         ibeam_profile = None
         min_area = float("inf")
         center_2d = adsk.core.Point2D.create(cx, cy)
@@ -153,13 +139,24 @@ def run(_context):
         return
 
     # -------------------------------------------------------------------------
-    # 2. Derive cross-section defaults from the selected body's OBB
-    #
-    #    Sort all three dimensions; the longest is the beam axis.
-    #    The two shorter ones are the cross-section (flange_w × total_h).
-    #    Flange width  → larger  cross-section dim
-    #    Total height  → smaller cross-section dim
-    #    Thickness     → smaller_dim / 6  (equal for flange and web by default)
+    # 2. ASK ORIENTATION FIRST (Right after body selection)
+    # -------------------------------------------------------------------------
+    orientation = ui.messageBox(
+        "Beam orientation?\n\n"
+        "Yes  →  Wide  (flanges along the wider cross-section axis)\n"
+        "No   →  Tall  (flanges along the narrower cross-section axis)",
+        "Beam Orientation",
+        adsk.core.MessageBoxButtonTypes.YesNoButtonType,
+        adsk.core.MessageBoxIconTypes.QuestionIconType,
+    )
+    # If the user closes the message box window without clicking yes/no
+    if orientation == adsk.core.DialogResults.DialogCancel:
+        return
+
+    orient_wide = orientation == adsk.core.DialogResults.DialogYes
+
+    # -------------------------------------------------------------------------
+    # 3. Derive cross-section defaults based on OBB and chosen orientation
     # -------------------------------------------------------------------------
     obb0 = selected_body.orientedMinimumBoundingBox
     all_dims = sorted(
@@ -171,19 +168,27 @@ def run(_context):
         key=lambda x: x[0],
     )
 
-    # all_dims[2] = beam axis (longest) — not used for defaults here
-    cs_small_val, _ = all_dims[0]  # smaller cross-section dim → total_h default
-    cs_large_val, _ = all_dims[1]  # larger  cross-section dim → flange_w default
+    cs_small_val, _ = all_dims[0]  # smaller cross-section dim
+    cs_large_val, _ = all_dims[1]  # larger  cross-section dim
+
+    # Dynamically shift default inputs depending on user's orientation choice
+    if orient_wide:
+        default_w = cs_large_val
+        default_h = cs_small_val
+    else:
+        default_w = cs_small_val
+        default_h = cs_large_val
+
     thickness_default = cs_small_val / 6.0
 
     # -------------------------------------------------------------------------
-    # 3. Prompt with computed defaults
+    # 4. Prompt for Dimensions with smart dynamic defaults
     # -------------------------------------------------------------------------
-    flange_w = ask("Flange width", fmt(cs_large_val))
+    flange_w = ask("Flange width", fmt(default_w))
     if flange_w is None:
         return
 
-    total_h = ask("Total height", fmt(cs_small_val))
+    total_h = ask("Total height", fmt(default_h))
     if total_h is None:
         return
 
@@ -195,23 +200,13 @@ def run(_context):
     if web_t is None:
         return
 
-    orientation = ui.messageBox(
-        "Beam orientation?\n\n"
-        "Yes  →  Wide  (flanges along the wider cross-section axis)\n"
-        "No   →  Tall  (flanges along the narrower cross-section axis)",
-        "Beam Orientation",
-        adsk.core.MessageBoxButtonTypes.YesNoButtonType,
-        adsk.core.MessageBoxIconTypes.QuestionIconType,
-    )
-    orient_wide = orientation == adsk.core.DialogResults.DialogYes
-
     fw = flange_w / 2.0
     th = total_h / 2.0
     ft = flange_t
     wt = web_t / 2.0
 
     # -------------------------------------------------------------------------
-    # 4. Match sibling bodies
+    # 5. Match sibling bodies
     # -------------------------------------------------------------------------
     parent_comp = selected_body.parentComponent or rootComp
 
@@ -232,7 +227,7 @@ def run(_context):
     ]
 
     # -------------------------------------------------------------------------
-    # 5. Create beams — cross-section axes come from each body's own OBB
+    # 6. Create beams
     # -------------------------------------------------------------------------
     created = []
 
@@ -248,12 +243,8 @@ def run(_context):
                 key=lambda x: x[0],
             )
 
-            # dims[2] = beam axis (longest)
             beam_len, beam_dir = dims[2]
 
-            # Cross-section axes.
-            # Wide: larger dim → flange direction, smaller → height (default).
-            # Tall: swap so the beam stands on its narrow face instead.
             if orient_wide:
                 _, height_dir = dims[0]  # smaller → height
                 _, flange_dir = dims[1]  # larger  → flange width
