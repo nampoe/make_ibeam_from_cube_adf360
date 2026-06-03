@@ -28,10 +28,7 @@ def run(_context):
             ui.messageBox(f'"{value}" is not a valid length.\nExample: "100 mm"')
 
     def fmt(cm):
-        """Internal cm → rounded mm string for input-box defaults."""
-        mm = cm * 10.0
-        # Round to nearest 0.1 mm; strip trailing zeros for readability
-        s = f"{mm:.2f}".rstrip("0").rstrip(".")
+        s = f"{cm * 10.0:.2f}".rstrip("0").rstrip(".")
         return f"{s} mm"
 
     def best_end_face(body, beam_dir):
@@ -45,16 +42,47 @@ def run(_context):
                 best_face = face
         return best_face
 
-    def make_ibeam(comp, face, beam_len, fw, th, ft, wt, base_name):
+    def make_ibeam(
+        comp, face, beam_len, fw, th, ft, wt, base_name, flange_dir, height_dir
+    ):
+        """
+        flange_dir : unit Vector3D along the flange width  (OBB cross-section axis)
+        height_dir : unit Vector3D along the beam height   (OBB cross-section axis)
+
+        Both are in world space.  We project them into sketch space so the
+        I-beam profile follows the body's actual orientation, not the world grid.
+        """
         sketch = comp.sketches.add(face)
         sketch.name = base_name + "_IBeam_Profile"
+
+        # ── Map world-space cross-section axes → sketch-space basis vectors ──
+        # modelToSketchSpace converts a world Point3D to sketch Point2D.
+        # Offsetting the centroid by a unit direction and converting gives us
+        # the direction in sketch coordinates.
+        origin = face.centroid
+        c = sketch.modelToSketchSpace(origin)
+        cx, cy = c.x, c.y
+
+        def world_dir_to_sketch(d):
+            """Return the 2-D sketch-space vector for world-space unit vector d."""
+            pt = adsk.core.Point3D.create(
+                origin.x + d.x, origin.y + d.y, origin.z + d.z
+            )
+            sk = sketch.modelToSketchSpace(pt)
+            return sk.x - cx, sk.y - cy
+
+        # u = flange direction (horizontal),  v = height direction (vertical)
+        ux, uy = world_dir_to_sketch(flange_dir)
+        vx, vy = world_dir_to_sketch(height_dir)
+
+        def p(u, v):
+            return adsk.core.Point3D.create(
+                cx + u * ux + v * vx,
+                cy + u * uy + v * vy,
+                0,
+            )
+
         lines = sketch.sketchCurves.sketchLines
-        center = sketch.modelToSketchSpace(face.centroid)
-        cx, cy = center.x, center.y
-
-        def p(x, y):
-            return adsk.core.Point3D.create(cx + x, cy + y, 0)
-
         pts = [
             p(-fw, th),
             p(fw, th),
@@ -72,10 +100,7 @@ def run(_context):
         for i in range(len(pts)):
             lines.addByTwoPoints(pts[i], pts[(i + 1) % len(pts)])
 
-        # Pick the smallest-area profile that contains the web centroid.
-        # Sketching on a face projects the face boundary into the sketch,
-        # producing an outer-rectangle profile alongside the I-beam profile —
-        # both contain the centroid, so we disambiguate by area.
+        # Smallest-area profile that contains the web centroid = the I-shape
         ibeam_profile = None
         min_area = float("inf")
         center_2d = adsk.core.Point2D.create(cx, cy)
@@ -130,26 +155,35 @@ def run(_context):
     # -------------------------------------------------------------------------
     # 2. Derive cross-section defaults from the selected body's OBB
     #
-    #    Sort the three OBB dimensions: longest = beam axis,
-    #    the remaining two are the cross-section (width × height).
+    #    Sort all three dimensions; the longest is the beam axis.
+    #    The two shorter ones are the cross-section (flange_w × total_h).
     #    Flange width  → larger  cross-section dim
-    #    Total height  → smaller cross-section dim   (swap in inputbox if needed)
-    #    Flange/web t  → smaller_dim / 6  (equal by default, so web ≡ side thickness)
+    #    Total height  → smaller cross-section dim
+    #    Thickness     → smaller_dim / 6  (equal for flange and web by default)
     # -------------------------------------------------------------------------
-    obb = selected_body.orientedMinimumBoundingBox
-    all_dims = sorted([obb.length, obb.width, obb.height])  # ascending
-    # all_dims[2] = beam length, [0] and [1] = cross-section
-    cs_a, cs_b = all_dims[0], all_dims[1]  # smaller, larger
-    thickness_default = cs_a / 6.0  # flange_t == web_t
+    obb0 = selected_body.orientedMinimumBoundingBox
+    all_dims = sorted(
+        [
+            (obb0.length, obb0.lengthDirection),
+            (obb0.width, obb0.widthDirection),
+            (obb0.height, obb0.heightDirection),
+        ],
+        key=lambda x: x[0],
+    )
+
+    # all_dims[2] = beam axis (longest) — not used for defaults here
+    cs_small_val, _ = all_dims[0]  # smaller cross-section dim → total_h default
+    cs_large_val, _ = all_dims[1]  # larger  cross-section dim → flange_w default
+    thickness_default = cs_small_val / 6.0
 
     # -------------------------------------------------------------------------
-    # 3. Prompt for dimensions — pre-filled from the body
+    # 3. Prompt with computed defaults
     # -------------------------------------------------------------------------
-    flange_w = ask("Flange width", fmt(cs_b))
+    flange_w = ask("Flange width", fmt(cs_large_val))
     if flange_w is None:
         return
 
-    total_h = ask("Total height", fmt(cs_a))
+    total_h = ask("Total height", fmt(cs_small_val))
     if total_h is None:
         return
 
@@ -157,10 +191,19 @@ def run(_context):
     if flange_t is None:
         return
 
-    # Default web thickness == flange thickness ("center same size as sides")
-    web_t = ask("Web thickness", fmt(flange_t))
+    web_t = ask("Web thickness", fmt(flange_t))  # default = same as flange
     if web_t is None:
         return
+
+    orientation = ui.messageBox(
+        "Beam orientation?\n\n"
+        "Yes  →  Wide  (flanges along the wider cross-section axis)\n"
+        "No   →  Tall  (flanges along the narrower cross-section axis)",
+        "Beam Orientation",
+        adsk.core.MessageBoxButtonTypes.YesNoButtonType,
+        adsk.core.MessageBoxIconTypes.QuestionIconType,
+    )
+    orient_wide = orientation == adsk.core.DialogResults.DialogYes
 
     fw = flange_w / 2.0
     th = total_h / 2.0
@@ -189,25 +232,50 @@ def run(_context):
     ]
 
     # -------------------------------------------------------------------------
-    # 5. Create beams
+    # 5. Create beams — cross-section axes come from each body's own OBB
     # -------------------------------------------------------------------------
     created = []
 
     for body in matching_bodies:
         try:
             obb = body.orientedMinimumBoundingBox
-            dims = [
-                (obb.length, obb.lengthDirection),
-                (obb.width, obb.widthDirection),
-                (obb.height, obb.heightDirection),
-            ]
-            beam_len, beam_dir = max(dims, key=lambda x: x[0])
+            dims = sorted(
+                [
+                    (obb.length, obb.lengthDirection),
+                    (obb.width, obb.widthDirection),
+                    (obb.height, obb.heightDirection),
+                ],
+                key=lambda x: x[0],
+            )
+
+            # dims[2] = beam axis (longest)
+            beam_len, beam_dir = dims[2]
+
+            # Cross-section axes.
+            # Wide: larger dim → flange direction, smaller → height (default).
+            # Tall: swap so the beam stands on its narrow face instead.
+            if orient_wide:
+                _, height_dir = dims[0]  # smaller → height
+                _, flange_dir = dims[1]  # larger  → flange width
+            else:
+                _, flange_dir = dims[0]  # smaller → flange width
+                _, height_dir = dims[1]  # larger  → height
+
             end_face = best_end_face(body, beam_dir)
             if not end_face:
                 continue
 
             new_body = make_ibeam(
-                rootComp, end_face, beam_len, fw, th, ft, wt, body.name
+                rootComp,
+                end_face,
+                beam_len,
+                fw,
+                th,
+                ft,
+                wt,
+                body.name,
+                flange_dir,
+                height_dir,
             )
             if new_body:
                 created.append(new_body.name)
